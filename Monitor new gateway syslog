@@ -1,6 +1,45 @@
-// ========================================================
-// 1. General Hunt for CLI Commands, Shells, & Downloaders
-// ========================================================
+// ============================================================================
+// CITRIX NETSCALER / SENTINEL INCIDENT RESPONSE & DFIR PLAYBOOK
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// SECTION 1: MICROSOFT SENTINEL DETECTION & HUNTING QUERIES (KQL)
+// ----------------------------------------------------------------------------
+
+// 1. Operational Baseline & High-Severity Events (Last 3 Days)
+Syslog
+| where TimeGenerated > ago(3d)
+| where SyslogMessage has_any (
+    "LOGIN_FAILED",
+    "SSLVPN",
+    "CMD_EXECUTED",
+    "reboot",
+    "restart"
+)
+| project TimeGenerated, Computer, SeverityLevel, SyslogMessage
+| sort by TimeGenerated desc;
+
+
+// 2. NetScaler Configuration Modifications & Shell Drops (Last 3 Days)
+Syslog
+| where TimeGenerated > ago(3d)
+| where SyslogMessage has "CMD_EXECUTED"
+| where SyslogMessage has_any (
+    "add ",
+    "set ",
+    "rm ",
+    "bind ",
+    "unbind ",
+    "enable ",
+    "disable ",
+    "shell",
+    "reboot"
+)
+| project TimeGenerated, Computer, SyslogMessage
+| sort by TimeGenerated desc;
+
+
+// 3. Command Injection, Interactive Shells & Binary Downloaders
 Syslog
 | where ProcessName in~ ("auditd", "nslog", "nscli") or SyslogMessage has "CMD_EXECUTED"
 | where SyslogMessage has_any ("CMD_EXECUTED", "shell", "curl", "fetch", "wget", "bash", "chmod", "crontab")
@@ -9,9 +48,7 @@ Syslog
 | order by TimeGenerated desc;
 
 
-// ========================================================
-// 2. Hunt for Web Shell / Exploit Strings (Broad)
-// ========================================================
+// 4. Web Shell & Remote Code Execution (RCE) Hunt
 Syslog
 | where SyslogMessage has_any (".php", ".sh", ".pl", ".cgi") 
 | where SyslogMessage has_any ("cmd=", "eval", "base64", "/tmp/", "exec")
@@ -19,9 +56,7 @@ Syslog
 | order by TimeGenerated desc;
 
 
-// ========================================================
-// 3. Extracted Breakdown for Matched Keywords & Extensions
-// ========================================================
+// 5. Web Shell Artifact Parser with Extracted Indicators
 Syslog
 | where SyslogMessage has_any (".php", ".sh", ".pl", ".cgi") 
 | where SyslogMessage has_any ("cmd=", "eval", "base64", "/tmp/", "exec")
@@ -31,21 +66,192 @@ Syslog
 | order by TimeGenerated desc;
 
 
-// ========================================================
-// 4. Summarize Admin / Root Logins & Failures
-// ========================================================
+// 6. Root & Admin Authentication Audit (Failures vs. Successes)
 Syslog
 | where SyslogMessage has_any ("LOGIN_FAILED", "LOGIN_SUCCESS", "SYSTEM_CMD")
 | where SyslogMessage has_any ("root", "nsroot")
 | summarize FailureCount = countif(SyslogMessage has "FAILED"), SuccessCount = countif(SyslogMessage has "SUCCESS") by HostName, bin(TimeGenerated, 1h);
 
 
-// ========================================================
-// 5. Correlate Surrounding Shell Activity Around an Incident Window
-// (Replace  with actual timestamp, e.g., datetime(2026-09-27 14:30:00Z))
-// ========================================================
+// 7. Incident Time-Window Correlation (Shell & Root Activity)
+// Replace  with actual timestamp: e.g., datetime(2026-09-28 12:00:00Z)
 Syslog
 | where TimeGenerated between (datetime_add('minute', -10, ) .. datetime_add('minute', 10, ))
 | where SyslogMessage has_any ("CMD_EXECUTED", "SHELL", "sh", "bash", "root")
 | project TimeGenerated, HostName, ProcessName, SyslogMessage
 | order by TimeGenerated asc;
+
+// ----------------------------------------------------------------------------
+// SECTION 2: ON-APPLIANCE FORENSIC COLLECTION (BASH / CLI TRIAGE)
+// Run in the NetScaler FreeBSD shell (SSH -> type 'shell')
+// ----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Step 1: Create an Isolated Forensic Staging Directory
+# WHAT: Builds a timestamped working folder under /var/crash and navigates to it.
+# WHY: /var/crash has sufficient disk capacity and preserves data across basic reboots.
+# CHECK FOR: Ensures evidence collection does not overwrite or clutter active system paths.
+# -----------------------------------------------------------------------------
+mkdir -p /var/crash/forensics_case && cd /var/crash/forensics_case
+
+
+# -----------------------------------------------------------------------------
+# Step 2: Capture Volatile State, Process Tree, & Network Sockets
+# WHAT: Dumps system clock, uptime, OS version, running processes, sockets, and open handles.
+# WHY: Captures volatile memory artifacts that vanish if the device crashes, powers off, or reboots.
+# -----------------------------------------------------------------------------
+
+# WHAT: Captures UTC timestamp, system uptime, and kernel architecture.
+# WHY: Establishes the authoritative forensic time reference for log correlation.
+# CHECK FOR: Time skew between NetScaler and external SIEM/Syslog feeds.
+date -u > 01_system_time.txt
+uptime >> 01_system_time.txt
+uname -a >> 01_system_time.txt
+
+# WHAT: Dumps complete process hierarchy with broad arguments.
+# WHY: Detects unauthorized processes spawned by web server daemons (e.g., httpd spawning sh).
+# CHECK FOR: Orphan processes, shells (sh/bash) executing out of /tmp, /var/tmp, or /netscaler.
+ps -auxwwd > 02_processes.txt
+
+# WHAT: Lists all active TCP/UDP connections and numeric ports.
+# WHY: Identifies live command-and-control (C2) channels and listener ports.
+# CHECK FOR: Outbound connections to unknown foreign IPs from non-standard ports.
+netstat -an > 03_netstat_sockets.txt
+
+# WHAT: Maps open listening ports directly to the responsible process PID and name.
+# WHY: Netstat shows the socket, but sockstat points directly to the binary owning it.
+# CHECK FOR: Rogue listeners bound to 0.0.0.0 or internal ports bypassing gateway policies.
+sockstat -4 -6 > 04_sockstat_ports.txt
+
+# WHAT: Lists all files currently opened by processes and system users.
+# WHY: Attackers often keep file descriptors open to unlinked or hidden payloads on disk.
+# CHECK FOR: Deleted files marked '(deleted)' that are still held open by active PIDs.
+lsof > 05_open_files.txt 2>/dev/null
+
+
+# -----------------------------------------------------------------------------
+# Step 3: Capture Persistence, User Accounts, & Crontabs
+# WHAT: Backs up user definitions, automated task schedulers, SSH keys, and shell histories.
+# WHY: Attackers deploy persistent backdoors to retain access even after patches are applied.
+# -----------------------------------------------------------------------------
+mkdir -p persistence_evidence
+
+# WHAT: Copies local user database and shadow password mappings.
+# WHY: Determines if attacker created rogue local administrative or backdoor accounts.
+# CHECK FOR: New users added with UID 0 (root equivalent) or unauthorized interactive shells.
+cat /etc/passwd > persistence_evidence/passwd.txt
+cat /etc/master.passwd > persistence_evidence/master.passwd.txt 2>/dev/null
+
+# WHAT: Copies all scheduled cron execution tables across every system account.
+# WHY: Cron jobs are the primary persistence mechanism used to call reverse shells on a schedule.
+# CHECK FOR: Periodic curl/wget/fetch jobs running scripts out of /tmp or /var/tmp.
+cp -rp /var/cron/tabs persistence_evidence/crontabs
+
+# WHAT: Preserves SSH authorized keys and access profiles for the root account.
+# WHY: Verifies whether an attacker injected their public key to establish direct SSH persistence.
+# CHECK FOR: Unrecognized public keys or modified permissions in authorized_keys.
+cp -rp /root/.ssh persistence_evidence/root_ssh 2>/dev/null
+
+# WHAT: Dumps shell history files across root and user profiles.
+# WHY: Extracts commands typed interactively by the adversary while on the box.
+# CHECK FOR: Directory navigation, downloading tools, anti-forensics commands, or history wiping.
+cat /root/.*history > persistence_evidence/shell_history.txt 2>/dev/null
+
+# WHAT: Backs up the custom NetScaler boot configuration script.
+# WHY: rc.netscaler executes on every reboot; attackers modify it for persistence.
+# CHECK FOR: Appended bash/sh one-liners, reverse shells, or scripts launching at startup.
+cp -p /nsconfig/rc.netscaler persistence_evidence/rc.netscaler 2>/dev/null
+
+
+# -----------------------------------------------------------------------------
+# Step 4: Archive System Logs, Web Roots, & Staging Folders
+# WHAT: Packages raw system logs, running NetScaler configs, web roots, and scratch folders.
+# WHY: Gathers on-disk artifacts for offline digital forensic analysis without altering metadata.
+# -----------------------------------------------------------------------------
+
+# WHAT: Compresses all current and rotated operating system and NetScaler audit logs.
+# WHY: Preserves full log chains that provide forensic evidence of the initial compromise.
+# CHECK FOR: Log gaps, truncated rotated archives, or audit bypass events.
+tar -czvf logs.tar.gz /var/log/ /var/nslog/ 2>/dev/null
+
+# WHAT: Archives the primary running NetScaler network and policy configuration.
+# WHY: Verifies if policies, VIPs, or route tables were altered to intercept/divert traffic.
+# CHECK FOR: Altered AAA parameters, modified routing tables, or disabled auditing actions.
+tar -czvf nsconfig.tar.gz /nsconfig/ns.conf /nsconfig/license* 2>/dev/null
+
+# WHAT: Compresses all web application roots and VPN portal user interfaces.
+# WHY: Web shells are dropped directly into public-facing directories to bypass authentication.
+# CHECK FOR: Rogue .php, .cgi, or .sh files created within legitimate Citrix GUI directories.
+tar -czvf webroots.tar.gz /var/netscaler/gui/ /var/vpn/gui/ /netscaler/ns_gui/ 2>/dev/null
+
+# WHAT: Archives temporary write directories where exploits drop staging tools.
+# WHY: World-writable paths are standard targets for initial exploit payloads and binaries.
+# CHECK FOR: Compiled ELF binaries, executable scripts, and exploit remnants.
+tar -czvf staging_tmp.tar.gz /tmp /var/tmp 2>/dev/null
+
+
+# -----------------------------------------------------------------------------
+# Step 5: Package, Hash, and Prepare for Off-Box Extraction
+# WHAT: Consolidates the entire triage folder into one compressed tarball and creates a hash.
+# WHY: Secures the chain of custody and proves evidence was not altered during transport.
+# CHECK FOR: SHA256 integrity hash verification before and after moving off the appliance.
+# -----------------------------------------------------------------------------
+cd /var/crash
+tar -czvf netscaler_evidence.tar.gz forensics_case/
+sha256 netscaler_evidence.tar.gz > netscaler_evidence.sha256
+cat netscaler_evidence.sha256
+
+
+// ----------------------------------------------------------------------------
+// SECTION 3: OFFLINE TRIAGE & ANALYSIS COMMANDS (RUN ON DFIR JUMP BOX)
+// Execute on your secure analysis workstation after extracting the evidence tarball
+// ----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Transfer evidence off the appliance:
+# WHAT: Securely copies the archive and checksum file to your analysis workstation.
+# WHY: Analyzing evidence off the target prevents resource spikes and eliminates contamination.
+# -----------------------------------------------------------------------------
+# scp nsroot@:/var/crash/netscaler_evidence.* /local/evidence/path/
+# cd /local/evidence/path/ && tar -xzvf netscaler_evidence.tar.gz && cd forensics_case/
+
+# -----------------------------------------------------------------------------
+# Check 1: Review Bash History for Manual Attacker Actions
+# WHAT: Reads every command logged in captured interactive terminal history files.
+# WHY: Reconstructs attacker behavior and uncovers lateral movement or credential access.
+# CHECK FOR: Reconnaissance commands ('id', 'whoami'), discovery ('uname', 'cat /etc/passwd'), 
+#            network sweeps, or attempts to wipe logs (e.g., 'rm -rf /var/log/*').
+# -----------------------------------------------------------------------------
+cat persistence_evidence/shell_history.txt
+
+# -----------------------------------------------------------------------------
+# Check 2: Audit Crontabs for Scheduled Persistent Callbacks
+# WHAT: Displays all scheduled recurring tasks configured across all appliance accounts.
+# WHY: Identifies dormant or time-delayed malware installations and beacons.
+# CHECK FOR: Unrecognized lines running every minute/hour calling external IP addresses, 
+#            scripts executed with python/perl/bash, or files pulling from remote web servers.
+# -----------------------------------------------------------------------------
+cat persistence_evidence/crontabs/*
+
+# -----------------------------------------------------------------------------
+# Check 3: Scan Webroots for Dropped Web Shells & Injected PHP/CGI
+# WHAT: Regular-expression search for code evaluation functions inside GUI web folders.
+# WHY: Flags web shells that allow remote code execution through normal HTTP/HTTPS traffic.
+# CHECK FOR: Invocations of system execution functions (eval, passthru, shell_exec, system, 
+#            base64_decode, Popen) concealed inside administrative web files.
+# -----------------------------------------------------------------------------
+grep -rnE "(eval\(|passthru|shell_exec|system\(|base64_decode|exec\(|Popen)" webroots/
+
+# WHAT: Inventories all script-type files located within the web server directories.
+# WHY: Legitimate webroots have static file sets; unexpected scripts indicate dropped backdoors.
+# CHECK FOR: Newly placed standalone files with extensions like .php, .sh, .pl, or .cgi.
+find webroots/ -type f \(-name "*.php" -o -name "*.sh" -o -name "*.pl" -o -name "*.cgi"\)
+
+# -----------------------------------------------------------------------------
+# Check 4: Search Archived Logs for Pre-Auth Execution & Tool Invocations
+# WHAT: Searches compressed and uncompressed NetScaler audit logs for CLI commands & utilities.
+# WHY: Connects an external exploitation event to internal command execution on the appliance.
+# CHECK FOR: 'CMD_EXECUTED' events showing unauthorized shell drops, network downloads via 
+#            curl/fetch/wget, permissions changes (chmod +x), or processes running under nobody/root.
+# -----------------------------------------------------------------------------
+zgrep -iE "(CMD_EXECUTED|shell|curl|fetch|wget|bash)" logs/ns.log*
